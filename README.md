@@ -111,24 +111,6 @@ entry, query each polymer entity.
 | `rcsb_seqcoord_graphql` | Escape hatch: run any GraphQL query against the Sequence Coordinates API. |
 | `rcsb_describe_seqcoord_object` | Introspect the live schema to discover fields available on a seqcoord object (for use with `fields=`). |
 
-## Installing uv
-
-`rcsb-mcp` is run via `uvx`, which ships with [uv](https://docs.astral.sh/uv/) — a
-fast Python package manager. Install it once before proceeding:
-
-```bash
-# macOS / Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Windows (PowerShell)
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# or via pip (any platform)
-pip install uv
-```
-
-After installation, restart your terminal and verify with `uv --version`.
-
 ## Install
 
 ```bash
@@ -148,6 +130,12 @@ pip install -e .
 # or with uv
 uv pip install -e .
 ```
+
+## Installing uv
+
+`uvx` ships with [uv](https://docs.astral.sh/uv/). If you don't have it yet, refer to the
+[official uv installation docs](https://docs.astral.sh/uv/getting-started/installation/) for
+up-to-date instructions across all platforms.
 
 ## Run / test
 
