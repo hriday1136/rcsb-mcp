@@ -65,8 +65,6 @@ Unknown IDs are reported under `not_found`.
 | Tool | Object | Example ID                       |
 |------|--------|----------------------------------|
 | `rcsb_get_entries` | PDB entries | `"4HHB"`                         |
-| `rcsb_get_entry_annotations` | Entry biological/functional annotations (GO, domains, disease, ...) | `"4HHB"`                         |
-| `rcsb_get_entry_exp_info` | Entry experimental conditions / determination metadata | `"4HHB"`                         |
 | `rcsb_get_polymer_entities` | Polymer entities (protein/NA) | `"4HHB_1"`                       |
 | `rcsb_get_nonpolymer_entities` | Ligand/cofactor entities | `"4HHB_3"`                       |
 | `rcsb_get_branched_entities` | Carbohydrate entities | `"5FMB_2"`                       |
@@ -84,10 +82,10 @@ Unknown IDs are reported under `not_found`.
 | `rcsb_get_group_provenance` | Grouping provenance (single) | `"provenance_sequence_identity"` |
 | `rcsb_data_graphql` | Escape hatch: run any GraphQL query against the Data API. | —                                |
 
-The Search API only returns identifiers, so the search tools optionally
-**enrich** entry hits with metadata. Enrichment and all Data API tools query
-the GraphQL endpoint, batching every requested ID into one request. All 18
-typed tools are generated from a single registry in
+The Search API only returns identifiers, so a search is the first step: batch the
+returned ids into the matching `rcsb_get_*` tool to fetch titles, organisms, and
+other metadata (these tools query the GraphQL endpoint, batching every requested ID
+into one request). All 16 typed tools are generated from a single registry in
 [`queries.py`](src/rcsb_mcp/queries.py) (`DATA_OBJECTS`), so adding a field or
 endpoint is a one-line change.
 
@@ -112,6 +110,24 @@ entry, query each polymer entity.
 | `rcsb_seqcoord_group_annotations` | Annotations across a group; `summary=True` returns a positional summary. |
 | `rcsb_seqcoord_graphql` | Escape hatch: run any GraphQL query against the Sequence Coordinates API. |
 | `rcsb_describe_seqcoord_object` | Introspect the live schema to discover fields available on a seqcoord object (for use with `fields=`). |
+
+## Installing uv
+
+`rcsb-mcp` is run via `uvx`, which ships with [uv](https://docs.astral.sh/uv/) — a
+fast Python package manager. Install it once before proceeding:
+
+```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# or via pip (any platform)
+pip install uv
+```
+
+After installation, restart your terminal and verify with `uv --version`.
 
 ## Install
 
@@ -145,7 +161,7 @@ python -m rcsb_mcp.server
 rcsb-mcp
 
 # inspect interactively
-npx @modelcontextprotocol/inspector python -m rcsb_mcp.server
+npx @modelcontextprotocol/inspector python path/to/server.py
 ```
 
 There is also an end-to-end **evaluation suite** ([`evals/`](evals/)) — 10
@@ -154,7 +170,14 @@ answer real PDB questions. See [`evals/README.md`](evals/README.md) to run it.
 
 ## Connect to Claude Desktop
 
-Edit `claude_desktop_config.json`:
+To open the config file directly from Claude Desktop, navigate to:
+
+- **macOS:** Claude menu (top-left) → **Settings** → **Developer** → **Edit Config**
+- **Windows:** Hamburger menu (top-left) → **File** → **Settings** → **Developer** → **Edit Config**
+
+This opens `claude_desktop_config.json` in your default text editor. You can also
+edit it manually at:
+
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 
