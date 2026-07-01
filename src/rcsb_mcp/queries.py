@@ -11,7 +11,6 @@ from __future__ import annotations
 from typing import Any, NamedTuple
 
 from rcsb_mcp.chemical_search_attributes import CHEMICAL_SEARCH_ATTRIBUTES
-from rcsb_mcp.graphql_queries import ENTRY_ANNOTATIONS, ENTRY_EXP_INFO
 from rcsb_mcp.search_attributes import SEARCH_ATTRIBUTES
 
 # Valid return types accepted by the Search API.
@@ -804,14 +803,13 @@ DATA_OBJECTS: dict[str, DataObject] = {
         "rcsb_accession_info{deposit_date initial_release_date} "
         "rcsb_entry_container_identifiers{polymer_entity_ids non_polymer_entity_ids "
         "branched_entity_ids assembly_ids} "
-        "rcsb_primary_citation{title rcsb_journal_abbrev year pdbx_database_id_DOI} "
-        "pubmed{rcsb_pubmed_abstract_text}",
+        "rcsb_primary_citation{title rcsb_journal_abbrev year pdbx_database_id_DOI}",
     ),
     "polymer_entities": DataObject(
         "polymer_entities", "entity_ids", True, "String",
         'polymer entity IDs (entry_entity), e.g. "4HHB_1"',
         "rcsb_id rcsb_polymer_entity{pdbx_description formula_weight pdbx_number_of_molecules} "
-        "entity_poly{type rcsb_sample_sequence_length pdbx_seq_one_letter_code_can} "
+        "entity_poly{type rcsb_sample_sequence_length} "
         "rcsb_entity_source_organism{ncbi_scientific_name ncbi_taxonomy_id}",
     ),
     "nonpolymer_entities": DataObject(
@@ -913,14 +911,6 @@ DATA_OBJECTS: dict[str, DataObject] = {
         "rcsb_group_provenance_container_identifiers{group_provenance_id}",
         upper=False,
     ),
-    "entry_annotations": DataObject(
-        "entries", "entry_ids", True, "String", 'entry IDs, e.g. "4HHB"',
-        ENTRY_ANNOTATIONS
-    ),
-    "entry_exp_info": DataObject(
-        "entries", "entry_ids", True, "String", 'entry IDs, e.g. "4HHB"',
-        ENTRY_EXP_INFO
-    )
 }
 
 
@@ -936,6 +926,95 @@ def _clean_id_list(ids: list[str], upper: bool = True) -> list[str]:
     return cleaned
 
 
+def _normalize_fields(fields: str | None) -> str | None:
+    """Accept a GraphQL selection written with dotted paths, braces, or a mix.
+
+    The whole search side of this server speaks dotted attribute paths
+    (e.g. "rcsb_polymer_entity.pdbx_description"), so agents naturally write the
+    same into the Data API `fields` override — but GraphQL needs nested braces
+    ("rcsb_polymer_entity { pdbx_description }") and rejects the dot with a syntax
+    error. This normalizes both dialects: each whitespace-separated path is
+    expanded ("a.b.c" -> "a { b { c } }") and shared prefixes are merged, while
+    already-braced input passes through re-serialized.
+
+    Anything using GraphQL we don't model — arguments, aliases, directives,
+    fragments — is returned unchanged, so the raw selection still works verbatim.
+    """
+    if not fields or not fields.strip():
+        return fields
+    if "." not in fields:
+        return fields  # already a GraphQL selection (or plain names) — leave verbatim
+    if any(ch in fields for ch in "():@") or "..." in fields:
+        return fields  # dotted but also advanced GraphQL: don't risk mangling it
+
+    # Tokenize into NAME / DOT / LBRACE / RBRACE (whitespace separates).
+    tokens: list[tuple[str, str]] = []
+    i, n = 0, len(fields)
+    while i < n:
+        ch = fields[i]
+        if ch.isspace():
+            i += 1
+        elif ch in "{}.":
+            tokens.append(({"{": "LBRACE", "}": "RBRACE", ".": "DOT"}[ch], ch))
+            i += 1
+        elif ch.isalnum() or ch == "_":
+            j = i
+            while j < n and (fields[j].isalnum() or fields[j] == "_"):
+                j += 1
+            tokens.append(("NAME", fields[i:j]))
+            i = j
+        else:
+            return fields  # unexpected character: don't risk mangling it
+
+    def _merge(dst: dict, src: dict) -> None:
+        for key, sub in src.items():
+            _merge(dst.setdefault(key, {}), sub)
+
+    pos = 0
+
+    def _selection() -> dict:
+        nonlocal pos
+        tree: dict = {}
+        while pos < len(tokens) and tokens[pos][0] != "RBRACE":
+            if tokens[pos][0] != "NAME":
+                raise ValueError("expected a field name")
+            names = [tokens[pos][1]]
+            pos += 1
+            while pos < len(tokens) and tokens[pos][0] == "DOT":
+                pos += 1
+                if pos >= len(tokens) or tokens[pos][0] != "NAME":
+                    raise ValueError("expected a field name after '.'")
+                names.append(tokens[pos][1])
+                pos += 1
+            children: dict = {}
+            if pos < len(tokens) and tokens[pos][0] == "LBRACE":
+                pos += 1
+                children = _selection()
+                if pos >= len(tokens) or tokens[pos][0] != "RBRACE":
+                    raise ValueError("missing closing '}'")
+                pos += 1
+            node = tree
+            for nm in names[:-1]:
+                node = node.setdefault(nm, {})
+            _merge(node.setdefault(names[-1], {}), children)
+        return tree
+
+    def _render(tree: dict) -> str:
+        return " ".join(
+            f"{name} {{ {_render(sub)} }}" if sub else name
+            for name, sub in tree.items()
+        )
+
+    try:
+        tree = _selection()
+        if pos != len(tokens):
+            raise ValueError("unbalanced '}'")
+    except ValueError:
+        return fields  # malformed in our dialect: hand back as-is
+
+    return _render(tree)
+
+
 def build_data_query(
     object_key: str, ids: Any, fields: str | None = None
 ) -> dict[str, Any]:
@@ -944,8 +1023,11 @@ def build_data_query(
     Args:
         object_key: A key of DATA_OBJECTS (e.g. "entries", "assemblies").
         ids: A list of ids for batch objects, or a single id for singletons.
-        fields: Optional GraphQL selection set to use instead of the curated
-            default (omit the surrounding braces), e.g. "rcsb_id struct{title}".
+        fields: Optional selection set to use instead of the curated default (omit
+            the surrounding braces). Accepts GraphQL braces ("rcsb_id struct{title}"),
+            dotted paths ("rcsb_id struct.title"), or a mix — see _normalize_fields.
+            Top-level rcsb_id is always included (injected if your `fields` omits it)
+            so results stay identifiable and batch lookups can map them back to ids.
 
     Returns a {"query", "variables"} dict; ids ride in the "ids" variable.
     """
@@ -956,7 +1038,15 @@ def build_data_query(
             f"unknown object {object_key!r}; one of {sorted(DATA_OBJECTS)}"
         ) from None
 
-    selection = fields or spec.default_fields
+    selection = _normalize_fields(fields) or spec.default_fields
+    # Every Data API query MUST select top-level rcsb_id: batch results are mapped
+    # back to the requested ids by it (without it, every id wrongly reports as
+    # not_found — see _query_batch), and it makes each returned node identifiable.
+    # Curated defaults already lead with rcsb_id; a custom `fields` override might
+    # omit it, so inject it when the top-level selection lacks it. (A duplicate
+    # top-level field is harmless — GraphQL merges identically-named selections.)
+    if "rcsb_id" not in selection.split("{", 1)[0].split():
+        selection = f"rcsb_id {selection}"
     if spec.batch:
         var_type = f"[{spec.arg_type}!]!"
         id_list = ids if isinstance(ids, (list, tuple)) else [ids]
@@ -1056,7 +1146,7 @@ def build_sc_alignments_query(
     qid = str(query_id).strip()
     if not qid:
         raise ValueError("query_id must be a non-empty string")
-    selection = fields or SC_ALIGNMENTS_FIELDS
+    selection = _normalize_fields(fields) or SC_ALIGNMENTS_FIELDS
     query = (
         "query A($from: SequenceReference!, $to: SequenceReference!, "
         "$queryId: String!, $range: [Int!]) { "
@@ -1086,7 +1176,7 @@ def build_sc_annotations_query(
     qid = str(query_id).strip()
     if not qid:
         raise ValueError("query_id must be a non-empty string")
-    selection = fields or SC_ANNOTATIONS_FIELDS
+    selection = _normalize_fields(fields) or SC_ANNOTATIONS_FIELDS
     query = (
         "query An($queryId: String!, $reference: SequenceReference!, "
         "$sources: [AnnotationReference]!, $range: [Int!], $filters: [AnnotationFilterInput!]) { "
@@ -1120,7 +1210,7 @@ def build_sc_group_alignments_query(
     gid = str(group_id).strip()
     if not gid:
         raise ValueError("group_id must be a non-empty string")
-    selection = fields or SC_ALIGNMENTS_FIELDS
+    selection = _normalize_fields(fields) or SC_ALIGNMENTS_FIELDS
     query = (
         "query GA($group: GroupReference!, $groupId: String!, $filter: [String!]) { "
         f"group_alignments(group: $group, groupId: $groupId, filter: $filter) {{ {selection} }} "
@@ -1151,7 +1241,7 @@ def build_sc_group_annotations_query(
     if not gid:
         raise ValueError("group_id must be a non-empty string")
     root_field = "group_annotations_summary" if summary else "group_annotations"
-    selection = fields or SC_ANNOTATIONS_FIELDS
+    selection = _normalize_fields(fields) or SC_ANNOTATIONS_FIELDS
     query = (
         "query GAn($group: GroupReference!, $groupId: String!, "
         "$sources: [AnnotationReference]!, $filters: [AnnotationFilterInput!]) { "
