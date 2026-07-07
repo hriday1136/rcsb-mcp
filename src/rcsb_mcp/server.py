@@ -19,7 +19,9 @@ Run locally (stdio, for Claude Desktop / MCP Inspector):
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
+import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
@@ -173,7 +175,8 @@ RCSB Search, Data, and Sequence Coordinates APIs. You can:
   total_count (the full match count); pass `facets` to any rcsb_search_* tool to get a
   breakdown into buckets instead of hits.
 - INSPECT structures — fetch detailed properties, experimental info, and annotations with
-  the rcsb_get_* tools; use rcsb_describe_data_object to discover further fields to request.
+  the rcsb_get_* tools; discover further fields to request with rcsb_list_data_fields (flat
+  keyword search over an object's schema) or rcsb_describe_data_object (level-by-level).
 - RELATE sequences — map alignments and positional features across PDB, UniProt, and NCBI
   with the rcsb_seqcoord_* tools.
 
@@ -301,12 +304,22 @@ Return types and fetching details:
 - Search responses carry identifiers + scores ONLY — no titles, organisms, or other metadata.
   To present or reason about hits, take the returned ids and call the matching rcsb_get_* tool
   above (batch ALL ids into a single call) to get details — do not loop one id at a time.
-- The rcsb_get_* and rcsb_seqcoord_* tools return a compact default field set. If you need a property
-  they don't return, call rcsb_describe_data_object (Data API) or rcsb_describe_seqcoord_object
-  (Sequence Coordinates) with [into=, query=] to find the exact field path, then pass it to
-  the tool's `fields=` argument. `fields=` accepts EITHER dotted attribute paths
+- The rcsb_get_* and rcsb_seqcoord_* tools return a compact default field set. Field paths
+  shown in these tools' own descriptions/examples are already verified — use them directly. But
+  NEVER invent, guess, or infer any OTHER field name for `fields=` (or for rcsb_data_graphql /
+  rcsb_seqcoord_graphql) from memory, naming convention, or another API — an unverified path
+  fails GraphQL schema validation and wastes the call. If you need a property that is neither in
+  the defaults nor documented in the tool's description, FIRST confirm the exact field path
+  against the live schema, THEN pass it to the tool's `fields=` argument:
+    - Data API: the fastest way is rcsb_list_data_fields(object_key, query="<keyword>") — a flat
+      keyword search over the whole object's schema (incl. nested and cross-object fields) that
+      returns verified dotted paths with descriptions. Use rcsb_describe_data_object(into=, query=)
+      to instead list one level at a time / drill into a specific nested object.
+    - Sequence Coordinates: rcsb_describe_seqcoord_object(into=, query=).
+  `fields=` accepts EITHER dotted attribute paths
   (e.g. "rcsb_polymer_entity.pdbx_description") OR GraphQL nested-brace syntax
-  (e.g. "rcsb_polymer_entity { pdbx_description }"), and the two may be mixed.
+  (e.g. "rcsb_polymer_entity { pdbx_description }"), the two may be mixed, and multiple
+  paths are separated by spaces or commas.
 - Every search/Data/Sequence-Coordinates tool response includes a link to the interactive
   query editor for that exact request — `query_editor_url` (search) or `graphiql_url`
   (GraphQL). When you show your work, surface that link verbatim; never construct these
@@ -434,11 +447,16 @@ async def _get_json(url: str, params: dict[str, Any], service: str) -> dict[str,
 
 
 async def _graphql_field(body: dict[str, Any], field: str, url: str = DATA_GRAPHQL_URL) -> Any:
-    """Run a builder's GraphQL body and return data[field] (dict/list/None), raising on errors."""
+    """Run a builder's GraphQL body and return data[field] (dict/list/None), raising on errors.
+
+    An undefined-field error (from a bad `fields=` selection) is enriched with where that field
+    actually lives in the schema plus the discovery tool, so a wrong guess becomes one guided fix
+    rather than blind retry (see _enrich_field_errors). Other errors pass through verbatim.
+    """
     payload = await _post_graphql(body["query"], body.get("variables"), url=url)
     if payload.get("errors"):
         msgs = "; ".join(e.get("message", "") for e in payload["errors"])
-        raise RuntimeError(f"RCSB GraphQL error: {msgs}")
+        raise RuntimeError(f"RCSB GraphQL error: {await _enrich_field_errors(msgs, field, url)}")
     return (payload.get("data") or {}).get(field)
 
 
@@ -549,6 +567,141 @@ async def _describe_object(
         "field_count": len(fields),
         "fields": fields,
     }
+
+
+# Bounds for the flat field catalog (rcsb_list_data_fields). The Data API GraphQL schema is a
+# large, CYCLIC graph, so a recursive flatten must be bounded three ways: a per-path depth cap
+# (the tool's max_depth), a cap on returned rows (keeps the catalog out of context bloat), and a
+# hard cap on nodes visited (a backstop so a broad no-keyword walk can't run away). Cycles are
+# broken by refusing to re-enter a type already on the current path (see _flatten_object_fields).
+DATA_FIELDS_RESULT_CAP = 300
+DATA_FIELDS_NODE_CAP = 20000
+# A cold flatten introspects every distinct type in the subtree (~100+ round-trips at depth 4);
+# fetch each breadth-first level's types concurrently, bounded so we stay polite (avoid 429s).
+DATA_FIELDS_FETCH_CONCURRENCY = 8
+
+
+async def _flatten_object_fields(
+    root_type: str, url: str, max_depth: int, query: str | None, max_results: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """Breadth-first flatten of a GraphQL type into dotted field paths, filtered by keyword.
+
+    Walks nested object fields up to `max_depth` levels deep, recording every field as a
+    dotted path (e.g. "pubmed.rcsb_pubmed_abstract_text"). Guards against the schema's cycles
+    by not re-entering a type already on the current path — so a type may still appear under
+    different branches, but a back-reference (entry -> polymer_entities -> entry) stops. Returns
+    (fields, truncated); `truncated` is True if the result cap or node backstop cut the walk short.
+    Breadth-first so, when truncated, the shallower (usually more relevant) fields are the ones kept.
+
+    Each level's distinct types are introspected concurrently (bounded by
+    DATA_FIELDS_FETCH_CONCURRENCY) to keep a cold walk's wall-clock reasonable; _type_fields
+    caches per type, so the subsequent per-node reads are served from cache.
+    """
+    ql = query.strip().lower() if query and query.strip() else None
+    results: list[dict[str, Any]] = []
+    sem = asyncio.Semaphore(DATA_FIELDS_FETCH_CONCURRENCY)
+
+    async def _warm(type_name: str) -> None:
+        async with sem:
+            await _type_fields(type_name, url)
+
+    # level items: (type_name, path_prefix, ancestor_types_on_path, depth)
+    level: list[tuple[str, str, frozenset[str], int]] = [(root_type, "", frozenset({root_type}), 1)]
+    nodes = 0
+    while level:
+        # Warm the cache for every distinct type on this level in parallel before reading them.
+        await asyncio.gather(*(_warm(t) for t in {item[0] for item in level}))
+        nxt: list[tuple[str, str, frozenset[str], int]] = []
+        for type_name, prefix, ancestors, depth in level:
+            for raw in await _type_fields(type_name, url):
+                nodes += 1
+                if nodes > DATA_FIELDS_NODE_CAP:
+                    return results, True
+                d = _field_descriptor(raw)
+                path = f"{prefix}.{d['name']}" if prefix else d["name"]
+                if ql is None or ql in path.lower() or ql in (d["description"] or "").lower():
+                    results.append({
+                        "path": path, "kind": d["kind"], "type": d["type"],
+                        "list": d["list"], "description": d["description"],
+                    })
+                    if len(results) >= max_results:
+                        return results, True
+                if (d["kind"] == "object" and d["type"] and depth < max_depth
+                        and d["type"] not in ancestors):
+                    nxt.append((d["type"], path, ancestors | {d["type"]}, depth + 1))
+        level = nxt
+    return results, False
+
+
+# --- Field-error enrichment: turn a raw GraphQL "FieldUndefined" into a self-correcting hint --- #
+# graphql-java validation message, e.g. "Field 'rcsb_entity_source_organism' in type 'CoreEntry'
+# is undefined". This is the choke point that catches a bad `fields=` guess (the schema has no
+# interfaces/unions/args, so an undefined field is always a genuine mistake, never ambiguity).
+_FIELD_UNDEFINED_RE = re.compile(r"Field '([^']+)' in type '([^']+)' is undefined")
+# A malformed `fields=` selection (e.g. paths the normalizer couldn't expand) reaches the parser
+# and comes back as a syntax error; match it so we can explain the accepted format instead.
+_SYNTAX_ERR_RE = re.compile(r"invalid syntax|token recognition|antlr|parse error", re.IGNORECASE)
+# Reverse the DATA_OBJECTS registry so an error carrying a root field can name the object_key to
+# fix it with (currently an identity map, but kept derived so it stays correct if they diverge).
+_ROOT_FIELD_TO_OBJECT_KEY = {spec.root_field: key for key, spec in queries.DATA_OBJECTS.items()}
+
+
+async def _enrich_field_errors(msgs: str, root_field: str, url: str) -> str:
+    """Rewrite a GraphQL undefined-field error into an actionable, self-correcting message.
+
+    For each undefined field named in `msgs`, add (best-effort) where that field actually lives in
+    the schema and a close-name suggestion on the offending type, then steer to the field-discovery
+    tool — so a wrong `fields=` guess becomes one guided fix instead of blind retry. A malformed
+    selection (syntax error) instead gets the accepted `fields=` format explained. Returns the
+    original `msgs` unchanged for other errors, or if schema introspection is unavailable.
+    """
+    is_data = url == DATA_GRAPHQL_URL
+
+    def _discover(example: str) -> str:
+        return (
+            f'rcsb_list_data_fields("{_ROOT_FIELD_TO_OBJECT_KEY.get(root_field, root_field)}", '
+            f'query="{example}")' if is_data
+            else f'rcsb_describe_seqcoord_object("{root_field}", query="{example}")'
+        )
+
+    undefined = _FIELD_UNDEFINED_RE.findall(msgs)
+    if not undefined:
+        if _SYNTAX_ERR_RE.search(msgs):
+            return (
+                f"{msgs}. The `fields=` value must be a GraphQL selection: dotted paths like "
+                '"struct.title exptl.method" or braces like "struct { title }" (the two may be '
+                "mixed), with multiple paths separated by spaces or commas. Discover valid paths "
+                f"with {_discover('<keyword>')}, and pass verified paths (never guess)."
+            )
+        return msgs
+    example = undefined[0][0]
+    discover = _discover(example)
+    try:
+        root_type = (await _root_field_types(url)).get(root_field)
+    except Exception:
+        root_type = None
+    hints: list[str] = []
+    for field_name, type_name in undefined[:3]:  # cap so the message stays readable
+        parts = [f"Field '{field_name}' is not defined on type '{type_name}'."]
+        try:  # close-name suggestion (typo) among the offending type's real fields
+            siblings = [f.get("name") for f in await _type_fields(type_name, url)]
+            close = difflib.get_close_matches(field_name, [s for s in siblings if s], n=3, cutoff=0.7)
+            if close:
+                parts.append("Did you mean: " + ", ".join(close) + "?")
+        except Exception:
+            pass
+        if root_type:  # relocation: where this exact field name lives under the root object
+            try:
+                found, _ = await _flatten_object_fields(root_type, url, 3, field_name, 50)
+                elsewhere = [f["path"] for f in found if f["path"].split(".")[-1] == field_name][:5]
+                if elsewhere:
+                    parts.append("It exists in the schema at: " + ", ".join(elsewhere) + ".")
+            except Exception:
+                pass
+        hints.append(" ".join(parts))
+    return (" ".join(hints)
+            + f" Discover valid paths with {discover}, then pass verified paths to `fields=` "
+              "(never guess field names).")
 
 
 async def _query_batch(
@@ -1769,7 +1922,12 @@ async def rcsb_describe_data_object(
     Use this to find exactly what to request in a rcsb_get_* tool's `fields=` argument (or
     in rcsb_data_graphql). The rcsb_get_* default selections are compact summaries, but the
     underlying GraphQL types have far more (e.g. CoreEntry has ~100 fields). This tool
-    walks the schema so you can build a precise selection instead of guessing.
+    walks the schema so you can build a precise selection instead of guessing — ALWAYS confirm
+    a field here before passing it to `fields=` unless it is already shown in a rcsb_get_* tool's
+    own description; never invent or infer field names, as an unverified path fails GraphQL
+    schema validation. To FIND a field by keyword across the whole object in one call (instead
+    of drilling level by level), use rcsb_list_data_fields; use this tool to list a single
+    level's fields or to inspect a specific nested object.
 
     Workflow: rcsb_describe_data_object("entries") -> spot a nested object field such as
     "rcsb_entry_info" -> rcsb_describe_data_object("entries", into="rcsb_entry_info") to list
@@ -1800,6 +1958,75 @@ async def rcsb_describe_data_object(
         "object_key": object_key,
         **await _describe_object(root_field, DATA_GRAPHQL_URL, into, query),
     }
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def rcsb_list_data_fields(
+    object_key: str,
+    query: str | None = None,
+    max_depth: Annotated[int, Field(ge=1, le=6)] = 3,
+) -> dict[str, Any]:
+    """Discover Data API fields by keyword — the flat, searchable field catalog for the Data
+    API, the analogue of rcsb_list_pdb_search_attributes for the Search API.
+
+    Given a Data object (object_key) this walks the LIVE GraphQL schema and returns a FLAT list
+    of dotted field paths — including nested and cross-object traversal fields. For "entries"
+    that includes e.g. "struct.title", "rcsb_entry_info.resolution_combined",
+    "pubmed.rcsb_pubmed_abstract_text", "polymer_entities.rcsb_polymer_entity.pdbx_description"
+    — each with its GraphQL type and schema description. Filter with `query` to just what you need.
+
+    Use this to FIND a field to pass to a rcsb_get_* tool's `fields=` argument (or to
+    rcsb_data_graphql) by keyword, in one call, instead of guessing a name. Every path it returns
+    is verified against the live schema, so it is safe to use directly — do NOT invent or infer
+    field names. Complements rcsb_describe_data_object: THIS searches the whole object tree flat
+    by keyword; rcsb_describe_data_object lists one level at a time for structured drill-down.
+
+    Args:
+        object_key: Which Data object's schema to search — the same keys as the rcsb_get_* tools
+            and rcsb_describe_data_object, e.g. "entries", "polymer_entities", "assemblies",
+            "chem_comps", "interfaces", "uniprot", "pubmed", ...
+        query: Optional case-insensitive keyword, matched against each dotted path AND its
+            description (e.g. "resolution", "abstract", "organism", "ligand"). Omit to list every
+            field down to max_depth (capped) — prefer a keyword to keep the result focused.
+        max_depth: How many levels deep to walk nested objects (1-6, default 3, which covers the
+            object's own nested fields plus one cross-object traversal hop). A field like
+            "pubmed.rcsb_pubmed_abstract_text" needs depth >= 2;
+            "polymer_entities.rcsb_polymer_entity.pdbx_description" needs depth >= 3. Raise it to
+            reach deeper two-hop traversals (slower on a cold cache, as it introspects more of the
+            schema); lower it to keep the catalog small. For fields on a two-hop object it is
+            often cheaper to query that object directly (e.g. object_key="uniprot").
+
+    Returns:
+        {object_key, graphql_type, query, max_depth, field_count, fields:[{path, kind, type,
+        list, description}], truncated?, note?}. `kind` is "scalar" (a leaf you can select
+        directly in `fields=`) or "object" (drill further, or select with a sub-selection);
+        `list` is whether the field returns a list. When the catalog is capped, `truncated` is
+        true and `note` explains how to narrow it (add a `query`, lower `max_depth`).
+    """
+    if object_key not in queries.DATA_OBJECTS:
+        raise ValueError(f"object_key must be one of {sorted(queries.DATA_OBJECTS)}")
+    root_field = queries.DATA_OBJECTS[object_key].root_field
+    root_type = (await _root_field_types(DATA_GRAPHQL_URL)).get(root_field)
+    if not root_type:
+        raise ValueError(f"could not resolve a GraphQL type for root field {root_field!r}")
+    fields, truncated = await _flatten_object_fields(
+        root_type, DATA_GRAPHQL_URL, max_depth, query, DATA_FIELDS_RESULT_CAP
+    )
+    result: dict[str, Any] = {
+        "object_key": object_key,
+        "graphql_type": root_type,
+        "query": query,
+        "max_depth": max_depth,
+        "field_count": len(fields),
+        "fields": fields,
+    }
+    if truncated:
+        result["truncated"] = True
+        result["note"] = (
+            "Result set was capped. Add or narrow a `query` keyword, lower `max_depth`, or "
+            "scope to a nested object with rcsb_describe_data_object(into=...)."
+        )
+    return result
 
 
 @mcp.tool(annotations=READ_ONLY)

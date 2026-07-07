@@ -19,6 +19,7 @@ src/rcsb_mcp/
   prompts/pdb_assistant.md   Assistant persona + HTML-report format; served as the `pdb_assistant` MCP prompt (package data)
 tests/
   test_queries.py            Network-free unit tests for the query builders
+  test_server.py             Network-free tests for non-builder server logic (schema flatten), via a synthetic schema
 ```
 
 ## Architecture & conventions
@@ -30,9 +31,11 @@ tests/
   one entry per GraphQL root field (root field, id arg, batch/single, default field
   selection). **Adding a Data API object is ideally a one-line registry entry.**
 - **Compact defaults + escape hatches.** Each `rcsb_get_*`/`rcsb_seqcoord_*` tool returns a
-  curated compact field selection but accepts a `fields=` override; `rcsb_describe_data_object`
-  / `rcsb_describe_seqcoord_object` introspect the live schema for discovery; `rcsb_data_graphql` /
-  `rcsb_seqcoord_graphql` are raw passthroughs. Don't try to make defaults exhaustive.
+  curated compact field selection but accepts a `fields=` override; `rcsb_list_data_fields`
+  (flat keyword search over an object's schema), `rcsb_describe_data_object`, and
+  `rcsb_describe_seqcoord_object` introspect the live schema for field discovery;
+  `rcsb_data_graphql` / `rcsb_seqcoord_graphql` are raw passthroughs. Don't try to make defaults
+  exhaustive — and don't invent `fields=` paths; discover them against the live schema first.
 - **Server `instructions` = tool-usage guidance only** (routing, chaining, return
   types). Do **not** put application/presentation policy there — it's always-on for
   every client. That belongs in the project prompt.
@@ -40,8 +43,8 @@ tests/
 ## Dev workflow
 
 ```bash
-# Unit tests (no network) — run after touching queries.py
-hatch test                       # or: python tests/test_queries.py
+# Unit tests (no network) — run after touching queries.py or server.py
+hatch test                       # or: python tests/test_queries.py; python tests/test_server.py
 
 # Syntax check both core modules
 python -m py_compile src/rcsb_mcp/server.py src/rcsb_mcp/queries.py
@@ -54,7 +57,8 @@ npx @modelcontextprotocol/inspector python -m rcsb_mcp.server
 ```
 
 The package is installed editable, so source edits take effect on the next process
-start. The test file lives at `tests/test_queries.py`.
+start. Tests live at `tests/test_queries.py` (query builders) and `tests/test_server.py`
+(non-builder server logic, e.g. the schema flatten — driven by a synthetic schema, no network).
 
 ## The golden rule: validate against the live API before changing field selections
 
@@ -74,7 +78,11 @@ After validating, add/adjust the default and re-run `test_queries.py`.
 ## Gotchas
 
 - **GraphQL endpoints return HTTP 200 even on query errors** — the error is in the
-  `errors` array, not the status code. `_graphql_field` already raises on it.
+  `errors` array, not the status code. `_graphql_field` already raises on it, and
+  `_enrich_field_errors` rewrites an undefined-field error (a bad `fields=` guess) into a
+  self-correcting hint: where that field actually lives + the discovery tool. Keep that
+  enrichment OUT of the model-facing `instructions` — telling the model wrong guesses get
+  auto-corrected would undercut the "discover fields first, don't invent them" rule.
 - **ID case sensitivity.** Entry/entity/chem ids are upper-cased; group and
   `group_provenance` ids are case-sensitive opaque tokens (the `upper=False` flag in
   `DATA_OBJECTS`). Don't blanket-uppercase.
